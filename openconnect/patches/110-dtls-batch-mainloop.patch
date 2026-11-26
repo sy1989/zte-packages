@@ -1,0 +1,116 @@
+--- a/dtls.c
++++ b/dtls.c
+@@ -18,6 +18,7 @@
+ #include <config.h>
+ 
+ #include "openconnect-internal.h"
++#include "zxsec-glue.h"
+ 
+ #include <unistd.h>
+ #include <sys/types.h>
+@@ -193,6 +194,9 @@
+ 	if (connect_dtls_socket(vpninfo, NULL))
+ 		return -EINVAL;
+ 
++	zxsec_glue_dtls_init(vpninfo);
++	vpninfo->zxsec_dtls_active = 0;
++
+ 	vpn_progress(vpninfo, PRG_DEBUG,
+ 		     _("DTLS initialised. DPD %d, Keepalive %d\n"),
+ 		     vpninfo->dtls_times.dpd, vpninfo->dtls_times.keepalive);
+@@ -268,6 +272,67 @@
+ 	/* Nothing to do here for Cisco DTLS as it is preauthenticated */
+ 	if (vpninfo->dtls_state == DTLS_CONNECTED)
+ 		vpninfo->dtls_state = DTLS_ESTABLISHED;
++
++	/* ZXSEC 批量路径：recvmmsg ≤16 数据报 → 一次 SUBMIT_BATCH 解密。
++	 * 失败（含非 app 记录）→ 与原版一致走 dtls_reconnect。 */
++	if (vpninfo->zxsec_dtls_active) {
++		int r = 0;
++		while (readable) {
++			int len = MAX(16384, vpninfo->ip_info.mtu);
++			unsigned char *buf;
++
++			if (vpninfo->incoming_queue.count >= vpninfo->max_qlen) {
++				work_done = 1;
++				break;
++			}
++			if (!vpninfo->dtls_pkt) {
++				vpninfo->dtls_pkt = alloc_pkt(vpninfo, len);
++				if (!vpninfo->dtls_pkt) {
++					vpn_progress(vpninfo, PRG_ERR, _("Allocation failed\n"));
++					break;
++				}
++			}
++			buf = vpninfo->dtls_pkt->data - 1;
++			len = zxsec_dtls_read(vpninfo, buf, len + 1);
++			if (len <= 0) {
++				if (len < 0) {
++					free(vpninfo->dtls_pkt);
++					vpninfo->dtls_pkt = NULL;
++					zxsec_glue_dtls_disable();
++					dtls_reconnect(vpninfo, timeout);
++					return 1;
++				}
++				break;
++			}
++			vpninfo->dtls_times.last_rx = time(NULL);
++			switch (buf[0]) {
++			case AC_PKT_DATA:
++				vpninfo->dtls_pkt->len = len - 1;
++				queue_packet(&vpninfo->incoming_queue, vpninfo->dtls_pkt);
++				vpninfo->dtls_pkt = NULL;
++				work_done = 1;
++				break;
++			case AC_PKT_DPD_OUT:
++			{
++				char magic = AC_PKT_DPD_RESP;
++				if (zxsec_dtls_write(vpninfo, &magic, 1) != 1)
++					vpn_progress(vpninfo, PRG_ERR,
++						     _("Failed to send DPD response. Expect disconnect\n"));
++			}
++				continue;
++			case AC_PKT_DPD_RESP:
++			case AC_PKT_KEEPALIVE:
++				break;
++			default:
++				vpn_progress(vpninfo, PRG_ERR,
++					     _("ZXSEC: unexpected DTLS pkt type %02x\n"), buf[0]);
++				break;
++			}
++		}
++		r = 0; /* 占位，避免空分支警告 */
++		(void)r;
++		goto zx_tx;
++	}
+ 
+ 	while (readable) {
+ 		int len = MAX(16384, vpninfo->ip_info.mtu);
+@@ -409,6 +474,27 @@
+ 		;
+ 	}
+ 
++zx_tx:
++	/* ZXSEC 批量发送：榨干 outgoing_queue（≤16 包）→ 1 次 SUBMIT_BATCH → sendmmsg */
++	if (vpninfo->zxsec_dtls_active) {
++		int sent = zxsec_dtls_tx_batch(vpninfo);
++		if (sent < 0) {
++			if (sent == -ENOSYS) {
++				/* 压缩启用：禁批量，回落逐包路径 */
++				zxsec_glue_dtls_disable();
++				vpninfo->zxsec_dtls_active = 0;
++				goto legacy_tx;
++			}
++			dtls_reconnect(vpninfo, timeout);
++			return 1;
++		}
++		if (sent > 0) {
++			time(&vpninfo->dtls_times.last_tx);
++			work_done = 1;
++		}
++		return work_done;
++	}
++legacy_tx:
+ 	/* Service outgoing packet queue */
+ 	unmonitor_write_fd(vpninfo, dtls);
+ 	while (vpninfo->outgoing_queue.head) {

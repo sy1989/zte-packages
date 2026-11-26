@@ -1,0 +1,31 @@
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -305,7 +305,8 @@
+ 	$(am__objects_39) $(am__objects_41)
+ @JNI_STANDALONE_TRUE@@OPENCONNECT_JNI_TRUE@am__objects_43 = libopenconnect_la-jni.lo
+ am_libopenconnect_la_OBJECTS = libopenconnect_la-version.lo \
+-	$(am__objects_42) $(am__objects_43)
++	$(am__objects_42) $(am__objects_43) \
++	libopenconnect_la-zxsec-record.lo libopenconnect_la-zxsec-glue.lo
+ libopenconnect_la_OBJECTS = $(am_libopenconnect_la_OBJECTS)
+ libopenconnect_la_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CC \
+ 	$(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=link $(CCLD) \
+@@ -1421,6 +1422,18 @@
+ @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+ @am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libopenconnect_la_CFLAGS) $(CFLAGS) -c -o libopenconnect_la-multicert.lo `test -f 'multicert.c' || echo '$(srcdir)/'`multicert.c
+ 
++libopenconnect_la-zxsec-record.lo: zxsec-record.c
++@am__fastdepCC_TRUE@	$(AM_V_CC)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libopenconnect_la_CFLAGS) $(CFLAGS) -MT libopenconnect_la-zxsec-record.lo -MD -MP -MF $(DEPDIR)/libopenconnect_la-zxsec-record.Tpo -c -o libopenconnect_la-zxsec-record.lo `test -f 'zxsec-record.c' || echo '$(srcdir)/'`zxsec-record.c
++@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/libopenconnect_la-zxsec-record.Tpo $(DEPDIR)/libopenconnect_la-zxsec-record.Plo
++@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='zxsec-record.c' object='libopenconnect_la-zxsec-record.lo' libtool=yes @AMDEPBACKSLASH@
++@AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
++@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libopenconnect_la_CFLAGS) $(CFLAGS) -c -o libopenconnect_la-zxsec-record.lo `test -f 'zxsec-record.c' || echo '$(srcdir)/'`zxsec-record.c
++libopenconnect_la-zxsec-glue.lo: zxsec-glue.c
++@am__fastdepCC_TRUE@	$(AM_V_CC)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libopenconnect_la_CFLAGS) $(CFLAGS) -MT libopenconnect_la-zxsec-glue.lo -MD -MP -MF $(DEPDIR)/libopenconnect_la-zxsec-glue.Tpo -c -o libopenconnect_la-zxsec-glue.lo `test -f 'zxsec-glue.c' || echo '$(srcdir)/'`zxsec-glue.c
++@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/libopenconnect_la-zxsec-glue.Tpo $(DEPDIR)/libopenconnect_la-zxsec-glue.Plo
++@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='zxsec-glue.c' object='libopenconnect_la-zxsec-glue.lo' libtool=yes @AMDEPBACKSLASH@
++@AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
++@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libopenconnect_la_CFLAGS) $(CFLAGS) -c -o libopenconnect_la-zxsec-glue.lo `test -f 'zxsec-glue.c' || echo '$(srcdir)/'`zxsec-glue.c
+ libopenconnect_la-dtls.lo: dtls.c
+ @am__fastdepCC_TRUE@	$(AM_V_CC)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libopenconnect_la_CFLAGS) $(CFLAGS) -MT libopenconnect_la-dtls.lo -MD -MP -MF $(DEPDIR)/libopenconnect_la-dtls.Tpo -c -o libopenconnect_la-dtls.lo `test -f 'dtls.c' || echo '$(srcdir)/'`dtls.c
+ @am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/libopenconnect_la-dtls.Tpo $(DEPDIR)/libopenconnect_la-dtls.Plo

@@ -1,0 +1,35 @@
+--- a/ssl/t1_enc.c
++++ b/ssl/t1_enc.c
+@@ -232,6 +232,32 @@
+     if (SSL_CONNECTION_IS_DTLS(s))
+         dtls1_increment_epoch(s, which);
+ 
++
++    /*
++     * ZXSEC hook: expose the freshly derived TLS1.2/DTLS1.2 record keys to the
++     * embedding application (openconnect). Weak symbol: the callback is only
++     * provided when the application links one. We deliberately hook only the
++     * TLS<=1.2 path here; TLS1.3 derives keys elsewhere (t13_build...), so
++     * the callback never fires for TLS1.3 sessions.
++     */
++    {
++        extern void oc_zxsec_on_keys(SSL *ssl, int is_dtls, int is_write,
++                                     uint16_t w_epoch,
++                                     const unsigned char *key, size_t key_len,
++                                     const unsigned char *iv, size_t iv_len)
++            __attribute__((weak));
++        if (oc_zxsec_on_keys != NULL
++                && c != NULL
++                && EVP_CIPHER_get_mode(c) == EVP_CIPH_GCM_MODE) {
++            /* TLS1.2 has exactly one key change per direction (CCS); every
++             * firing of this hook installs the application protection keys. */
++            uint16_t ep = (SSL_CONNECTION_IS_DTLS(s) && (which & SSL3_CC_WRITE))
++                          ? dtls1_get_epoch(s, which) : 0;
++            oc_zxsec_on_keys(SSL_CONNECTION_GET_SSL(s),
++                             SSL_CONNECTION_IS_DTLS(s) ? 1 : 0,
++                             (which & SSL3_CC_WRITE) ? 1 : 0, ep, key, cl, iv, (size_t)k);
++        }
++    }
+     if (!ssl_set_new_record_layer(s, s->version, direction,
+             OSSL_RECORD_PROTECTION_LEVEL_APPLICATION,
+             NULL, 0, key, cl, iv, (size_t)k, mac_secret,

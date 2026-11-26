@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2006-2026 OpenWrt.org
+# Copyright (C) 2026 ZTE Packages
 #
 # This is free software, licensed under the GNU General Public License v2.
 # See /LICENSE for more information.
@@ -8,22 +8,23 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=openconnect
-PKG_VERSION:=9.21
-PKG_RELEASE:=1
+PKG_VERSION:=9.12
+PKG_RELEASE:=3
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://www.infradead.org/openconnect/download
-PKG_HASH:=5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58
+PKG_HASH:=a2bedce3aa4dfe75e36e407e48e8e8bc91d46def5335ac9564fbf91bd4b2413e
 
 PKG_LICENSE:=LGPL-2.1-or-later
 PKG_LICENSE_FILES:=COPYING.LGPL
 PKG_CPE_ID:=cpe:/a:infradead:openconnect
 
 PKG_CONFIG_DEPENDS:= \
-	CONFIG_OPENCONNECT_GNUTLS \
 	CONFIG_OPENCONNECT_OPENSSL \
+	CONFIG_OPENCONNECT_GNUTLS
 
 PKG_BUILD_FLAGS:=no-mips16
+PKG_BUILD_PARALLEL:=1
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/nls.mk
@@ -35,9 +36,12 @@ endef
 define Package/openconnect
   SECTION:=net
   CATEGORY:=Network
-  DEPENDS:=+libxml2 +kmod-tun +resolveip +vpnc-scripts +OPENCONNECT_OPENSSL:libopenssl +OPENCONNECT_OPENSSL:p11-kit +OPENCONNECT_OPENSSL:libp11 +OPENCONNECT_GNUTLS:libgnutls +OPENCONNECT_GNUTLS:libtasn1 +OPENCONNECT_STOKEN:libstoken $(ICONV_DEPENDS) $(INTL_DEPENDS)
-  TITLE:=OpenConnect VPN client (Cisco AnyConnect and Juniper/Pulse compatible)
-  MAINTAINER:=Nikos Mavrogiannopoulos <n.mavrogiannopoulos@gmail.com>
+  DEPENDS:=+libxml2 +kmod-tun +resolveip +vpnc-scripts \
+	   +OPENCONNECT_OPENSSL:libopenssl \
+	   +OPENCONNECT_GNUTLS:libgnutls +OPENCONNECT_GNUTLS:libtasn1 \
+	   $(ICONV_DEPENDS) $(INTL_DEPENDS)
+  TITLE:=OpenConnect VPN client (OpenSSL/ZXSEC or GnuTLS)
+  MAINTAINER:=ZTE Packages <packages@example.com>
   URL:=https://www.infradead.org/openconnect/
   SUBMENU:=VPN
 endef
@@ -45,14 +49,24 @@ endef
 define Package/openconnect/description
 	A VPN client compatible with several SSL VPN implementations (ocserv, Cisco AnyConnect, Juniper, Palo Alto)
 
-	OpenConnect is an SSL VPN client initially created to support Cisco's
-	AnyConnect SSL VPN. It has since been extended to support the Pulse Connect
-	Secure VPN (formerly known as Juniper Network Connect or Junos Pulse) and
-	the Palo Alto Networks GlobalProtect SSL VPN.
+	Two TLS backends are selectable at build time:
 
-	A corresponding OpenConnect VPN server implementation can be found in the
-	ocserv package.
+	* OpenSSL + ZXSEC: the DTLS data path is taken over by a
+	  self-managed record layer that submits records to
+	  /dev/zx279133-sec in batches (SUBMIT_BATCH, up to 16 records per
+	  ioctl) while keeping the wire format unchanged. The CSTP/TCP
+	  channel uses the same record layer (one 16K TLS record per
+	  submit) once TLS1.2 + AES-GCM is negotiated. Needs the
+	  ZXSEC-enabled libssl from this feed; falls back to plain OpenSSL
+	  at run time (ZXSEC_DISABLE=1) or when the key hook is missing.
+	* GnuTLS + ZXSEC: the DTLS and CSTP/TCP record layers are taken over
+	  in exactly the same way as the OpenSSL backend. The gnutls package
+	  in this feed carries a key hook in _gnutls_set_keys() and exports
+	  the current record sequence number so the self-managed codec can
+	  stay in sync after the handshake. Requires libgnutls from this feed.
 endef
+
+TARGET_LDFLAGS += -Wl,--export-dynamic
 
 CONFIGURE_ARGS += \
 	--disable-shared \
@@ -63,17 +77,23 @@ CONFIGURE_ARGS += \
 	--without-stoken \
 	--without-libpskc \
 	--without-gssapi \
-	--without-lz4
+	--without-lz4 \
+	--without-libproxy
 
-ifeq ($(CONFIG_OPENCONNECT_OPENSSL),y)
+ifeq ($(CONFIG_OPENCONNECT_GNUTLS),y)
+CONFIGURE_ARGS += \
+	--with-gnutls \
+	--without-openssl
+else
 CONFIGURE_ARGS += \
 	--without-gnutls
 endif
 
-ifeq ($(CONFIG_OPENCONNECT_STOKEN),y)
-CONFIGURE_ARGS += \
-	--with-stoken
-endif
+# 所有补丁对两个后端都应用：后端专属文件（openssl.c / gnutls.c 等）
+# 在 configure 时只会编译其中一个，另一个保持未使用状态。
+# src/ 里的 zxsec-*.c 由 Build/Prepare/Default 自动拷进构建目录
+# （`[ ! -d ./src/ ] || cp -fpR ./src/. $(PKG_BUILD_DIR)`），不需要额外规则；
+# 130 补丁把它们加进 libopenconnect 的对象列表，两个后端都会链入。
 
 define Package/openconnect/install
 	$(INSTALL_DIR) $(1)/etc/openconnect/

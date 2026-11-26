@@ -1,0 +1,95 @@
+--- a/openssl.c
++++ b/openssl.c
+@@ -18,6 +18,7 @@
+ #include <config.h>
+ 
+ #include "openconnect-internal.h"
++#include "zxsec-glue.h"
+ 
+ #include <openssl/crypto.h>
+ #include <openssl/ssl.h>
+@@ -192,6 +193,8 @@
+ 
+ static int openconnect_openssl_write(struct openconnect_info *vpninfo, char *buf, size_t len)
+ {
++	if (zxsec_cstp_active(vpninfo))
++		return zxsec_cstp_write_wait(vpninfo, buf, len);
+ 	return _openconnect_openssl_write(vpninfo->https_ssl, vpninfo->ssl_fd, vpninfo, buf, len);
+ }
+ 
+@@ -250,6 +253,9 @@
+ 
+ static int openconnect_openssl_read(struct openconnect_info *vpninfo, char *buf, size_t len)
+ {
++	/* HTTP CONNECT 阶段也在本层收发，必须保持阻塞语义 */
++	if (zxsec_cstp_active(vpninfo))
++		return zxsec_cstp_read_wait(vpninfo, buf, len);
+ 	return _openconnect_openssl_read(vpninfo->https_ssl, vpninfo->ssl_fd, vpninfo, buf, len, 0);
+ }
+ 
+@@ -267,7 +273,10 @@
+ 		return -EINVAL;
+ 
+ 	while (1) {
+-		ret = SSL_read(vpninfo->https_ssl, buf + i, 1);
++		/* 记录层接管后，逐字节读也走明文缓冲 */
++		ret = zxsec_cstp_active(vpninfo)
++			? zxsec_cstp_read_wait(vpninfo, buf + i, 1)
++			: SSL_read(vpninfo->https_ssl, buf + i, 1);
+ 		if (ret == 1) {
+ 			if (buf[i] == '\n') {
+ 				buf[i] = 0;
+@@ -324,6 +333,14 @@
+ 	SSL *ssl = dtls ? vpninfo->dtls_ssl : vpninfo->https_ssl;
+ 	int len, ret;
+ 
++	/* CSTP 记录层接管时，application_data 由自管记录层解密。
++	 * -EAGAIN（暂无数据）对上层等价于 SSL_ERROR_WANT_READ → 0 */
++	if (!dtls && zxsec_cstp_active(vpninfo)) {
++		int r = zxsec_cstp_read(vpninfo, buf, maxlen);
++
++		return r == -EAGAIN ? 0 : r;
++	}
++
+ 	if (!ssl) {
+ 		vpn_progress(vpninfo, PRG_ERR,
+ 			     _("Attempted to read from non-existent %s session\n"),
+@@ -349,6 +366,14 @@
+ 	SSL *ssl = dtls ? vpninfo->dtls_ssl : vpninfo->https_ssl;
+ 	int ret;
+ 
++	/* CSTP 记录层接管时，application_data 由自管记录层加密。
++	 * -EAGAIN（记录没写完）对上层等价于 SSL_ERROR_WANT_WRITE → 0 */
++	if (!dtls && zxsec_cstp_active(vpninfo)) {
++		int r = zxsec_cstp_write(vpninfo, buf, buflen);
++
++		return r == -EAGAIN ? 0 : r;
++	}
++
+ 	if (!ssl) {
+ 		vpn_progress(vpninfo, PRG_ERR,
+ 			     _("Attempted to write to non-existent %s session\n"),
+@@ -2057,6 +2082,13 @@
+ 	vpninfo->ssl_write = openconnect_openssl_write;
+ 	vpninfo->ssl_gets = openconnect_openssl_gets;
+ 
++	/* ZXSEC：握手一结束就接管记录层，此后这条连接上所有
++	 * application_data（认证 POST、HTTP CONNECT、隧道数据）都由自管
++	 * 记录层加解密，write seq 从 1 连续递增（Finished 已经用掉 0）。
++	 * 不能等 CONNECT 前才接管——那时认证 POST 已经用掉了若干个 seq，
++	 * 再从 1 开始会让服务端因 nonce/AAD 里的 seq 不匹配而丢弃记录
++	 * （表现为 CONNECT 无响应、连接被关）。 */
++	zxsec_glue_tls_bind(vpninfo);
+ 
+ 	vpn_progress(vpninfo, PRG_INFO, _("Connected to HTTPS on %s with ciphersuite %s\n"),
+ 		     vpninfo->hostname, vpninfo->cstp_cipher);
+@@ -2072,6 +2104,9 @@
+ void openconnect_close_https(struct openconnect_info *vpninfo, int final)
+ {
+ 	if (vpninfo->https_ssl) {
++		/* 记录层跟着这条 SSL 一起失效：不清掉的话下一个 SSL 有可能
++		 * 分配到相同地址，zxsec_cstp_active() 会误判为已被接管 */
++		zxsec_glue_tls_unbind(vpninfo);
+ 		SSL_free(vpninfo->https_ssl);
+ 		vpninfo->https_ssl = NULL;
+ 	}

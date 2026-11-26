@@ -1,0 +1,69 @@
+--- a/lib/constate.c
++++ b/lib/constate.c
+@@ -183,6 +183,66 @@
+ 						 sizeof(buf), NULL));
+ 	}
+ 
++	/* ZXSEC: expose the final TLS1.2 record keys to openconnect's
++	 * out-of-tree batch record layer.  The weak reference keeps this
++	 * patch harmless for builds which do not link the hook, and this
++	 * code path is only used by TLS1.2/DTLS1.2 (_tls13_set_keys() is
++	 * separate and never reaches here). */
++	{
++		extern void oc_zxsec_gnutls_on_keys(void *session, int is_dtls,
++					    int epoch, int is_write,
++					    const unsigned char *key,
++					    unsigned key_len,
++					    const unsigned char *iv,
++					    unsigned iv_len,
++					    int cipher_id, int version_id)
++			__attribute__((weak));
++
++		if (oc_zxsec_gnutls_on_keys != NULL && params->cipher != NULL &&
++		    client_write->key_size > 0 && IV_size > 0) {
++			int ours = (session->security_parameters.entity == GNUTLS_CLIENT);
++
++			/* openconnect is a client: client_write == write direction */
++			oc_zxsec_gnutls_on_keys(session, IS_DTLS(session),
++					(int)params->epoch, ours ? 1 : 0,
++					client_write->key, client_write->key_size,
++					client_write->iv, client_write->iv_size,
++					(int)params->cipher->id,
++					(int)get_num_version(session));
++			oc_zxsec_gnutls_on_keys(session, IS_DTLS(session),
++					(int)params->epoch, ours ? 0 : 1,
++					server_write->key, server_write->key_size,
++					server_write->iv, server_write->iv_size,
++					(int)params->cipher->id,
++					(int)get_num_version(session));
++		}
++	}
++
++	return 0;
++}
++
++/* ZXSEC: read the next record sequence numbers of the active epoch.
++ * openconnect must align its own counter after the handshake because
++ * GnuTLS has already consumed sequence numbers for handshake records. */
++int oc_zxsec_gnutls_get_seq(void *session, uint64_t *read_seq,
++			    uint64_t *write_seq)
++{
++	record_parameters_st *params = NULL;
++	int ret;
++
++	if (read_seq) {
++		ret = _gnutls_epoch_get(session, EPOCH_READ_CURRENT, &params);
++		if (ret < 0)
++			return ret;
++		*read_seq = params->read.sequence_number;
++	}
++	if (write_seq) {
++		params = NULL;
++		ret = _gnutls_epoch_get(session, EPOCH_WRITE_CURRENT, &params);
++		if (ret < 0)
++			return ret;
++		*write_seq = params->write.sequence_number;
++	}
+ 	return 0;
+ }
+ 

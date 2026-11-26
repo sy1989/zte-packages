@@ -1,0 +1,11 @@
+--- a/openconnect-internal.h
++++ b/openconnect-internal.h
+@@ -746,6 +746,8 @@
+ #endif
+ 	int ssl_fd;
+ 	int dtls_fd;
++	/* ZXSEC 批量记录层 */
++	int zxsec_dtls_active;
+ 
+ 	int dtls_tos_current;
+ 	int dtls_pass_tos;

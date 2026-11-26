@@ -1,22 +1,37 @@
-# openconnect avanced configuration
+# openconnect advanced configuration
 
 menu "Configuration"
 	depends on PACKAGE_openconnect
 
 choice
-	prompt "SSL library"
+	prompt "TLS backend"
 	default OPENCONNECT_GNUTLS
 
 config OPENCONNECT_GNUTLS
-	bool "GnuTLS support"
+	bool "GnuTLS + ZXSEC record layer (default)"
+	help
+	  Build against GnuTLS and enable the same ZXSEC batch record layer
+	  as the OpenSSL backend. The gnutls package in this feed patches
+	  _gnutls_set_keys() to export final TLS1.2/DTLS1.2 GCM keys and the
+	  current record sequence number; openconnect then takes over DTLS
+	  and CSTP/TCP records and submits them with SUBMIT_BATCH.
+
+	  Requires libgnutls from this feed (with the key-hook patch).
+	  Runtime fallback: ZXSEC_DISABLE=1 keeps the stock GnuTLS data path.
 
 config OPENCONNECT_OPENSSL
-	bool "OpenSSL"
+	bool "OpenSSL + ZXSEC record layer"
 	select OPENSSL_WITH_DTLS
+	help
+	  Build against OpenSSL (libssl/libcrypto) and enable the ZXSEC
+	  batch record layer: DTLS and CSTP/TCP submit records to
+	  /dev/zx279133-sec with SUBMIT_BATCH (up to 16 per ioctl).
+
+	  Requires libs/openssl from this feed (or an OpenSSL 3.5.7 tree
+	  carrying patches/160-zxsec-tls12-keyhook.patch). Without that
+	  key hook the record layer stays inactive and openconnect falls
+	  back to the native OpenSSL path automatically.
 
 endchoice
-
-config OPENCONNECT_STOKEN
-	bool "stoken support"
 
 endmenu

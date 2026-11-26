@@ -1,0 +1,147 @@
+--- a/gnutls.c
++++ b/gnutls.c
+@@ -18,6 +18,7 @@
+ #include <config.h>
+ 
+ #include "openconnect-internal.h"
++#include "zxsec-glue.h"
+ 
+ #include "gnutls.h"
+ 
+@@ -132,11 +133,15 @@
+ 
+ static int openconnect_gnutls_write(struct openconnect_info *vpninfo, char *buf, size_t len)
+ {
++	if (zxsec_cstp_active(vpninfo))
++		return zxsec_cstp_write_wait(vpninfo, buf, (int)len);
+ 	return _openconnect_gnutls_write(vpninfo->https_sess, vpninfo->ssl_fd, vpninfo, buf, len);
+ }
+ 
+ int openconnect_dtls_write(struct openconnect_info *vpninfo, void *buf, size_t len)
+ {
++	if (vpninfo->zxsec_dtls_active)
++		return zxsec_dtls_write_wait(vpninfo, buf, (int)len);
+ 	return _openconnect_gnutls_write(vpninfo->dtls_ssl, vpninfo->dtls_fd, vpninfo, buf, len);
+ }
+ 
+@@ -217,11 +222,15 @@
+ 
+ static int openconnect_gnutls_read(struct openconnect_info *vpninfo, char *buf, size_t len)
+ {
++	if (zxsec_cstp_active(vpninfo))
++		return zxsec_cstp_read_wait(vpninfo, buf, (int)len);
+ 	return _openconnect_gnutls_read(vpninfo->https_sess, vpninfo->ssl_fd, vpninfo, buf, len, 0);
+ }
+ 
+ int openconnect_dtls_read(struct openconnect_info *vpninfo, void *buf, size_t len, unsigned ms)
+ {
++	if (vpninfo->zxsec_dtls_active)
++		return zxsec_dtls_read_wait(vpninfo, buf, (int)len, ms);
+ 	return _openconnect_gnutls_read(vpninfo->dtls_ssl, vpninfo->dtls_fd, vpninfo, buf, len, ms);
+ }
+ 
+@@ -234,7 +243,9 @@
+ 		return -EINVAL;
+ 
+ 	while (1) {
+-		ret = gnutls_record_recv(vpninfo->https_sess, buf + i, 1);
++		ret = zxsec_cstp_active(vpninfo)
++			? zxsec_cstp_read_wait(vpninfo, buf + i, 1)
++			: gnutls_record_recv(vpninfo->https_sess, buf + i, 1);
+ 		if (ret == 1) {
+ 			if (buf[i] == '\n') {
+ 				buf[i] = 0;
+@@ -295,6 +306,11 @@
+ 	gnutls_session_t sess = dtls ? vpninfo->dtls_ssl : vpninfo->https_sess;
+ 	int ret;
+ 
++	if (!dtls && zxsec_cstp_active(vpninfo)) {
++		int r = zxsec_cstp_read(vpninfo, buf, maxlen);
++
++		return r == -EAGAIN ? 0 : r;
++	}
+ 	if (!sess) {
+ 		vpn_progress(vpninfo, PRG_ERR,
+ 			     _("Attempted to read from non-existent %s session\n"),
+@@ -319,6 +335,11 @@
+ 	gnutls_session_t sess = dtls ? vpninfo->dtls_ssl : vpninfo->https_sess;
+ 	int ret;
+ 
++	if (!dtls && zxsec_cstp_active(vpninfo)) {
++		int r = zxsec_cstp_write(vpninfo, buf, buflen);
++
++		return r == -EAGAIN ? 0 : r;
++	}
+ 	if (!sess) {
+ 		vpn_progress(vpninfo, PRG_ERR,
+ 			     _("Attempted to write to non-existent %s session\n"),
+@@ -2450,6 +2471,7 @@
+ 		vpn_progress(vpninfo, PRG_ERR,
+ 			     _("Failed to set GnuTLS priority string (\"%s\"): %s\n"),
+ 			     vpninfo->ciphersuite_config, gnutls_strerror(err));
++		zxsec_glue_tls_unbind(vpninfo);
+ 		gnutls_deinit(vpninfo->https_sess);
+ 		vpninfo->https_sess = NULL;
+ 		closesocket(ssl_sock);
+@@ -2486,6 +2508,9 @@
+ 	vpninfo->ssl_write = openconnect_gnutls_write;
+ 	vpninfo->ssl_gets = openconnect_gnutls_gets;
+ 
++	/* ZXSEC: 握手一结束就接管，认证 POST / CONNECT / 隧道数据都连续计数 */
++	zxsec_glue_tls_bind(vpninfo);
++
+ 	return 0;
+ }
+ 
+@@ -2518,6 +2543,7 @@
+ 			}
+ 			if (is_cancel_pending(vpninfo, &rd_set)) {
+ 				vpn_progress(vpninfo, PRG_ERR, _("SSL connection cancelled\n"));
++				zxsec_glue_tls_unbind(vpninfo);
+ 				gnutls_deinit(vpninfo->https_sess);
+ 				vpninfo->https_sess = NULL;
+ 				closesocket(ssl_sock);
+@@ -2530,6 +2556,7 @@
+ 			else
+ 				vpn_progress(vpninfo, PRG_ERR, _("SSL connection failure: %s\n"),
+ 								 gnutls_strerror(err));
++			zxsec_glue_tls_unbind(vpninfo);
+ 			gnutls_deinit(vpninfo->https_sess);
+ 			vpninfo->https_sess = NULL;
+ 			closesocket(ssl_sock);
+@@ -2559,6 +2586,7 @@
+ void openconnect_close_https(struct openconnect_info *vpninfo, int final)
+ {
+ 	if (vpninfo->https_sess) {
++		zxsec_glue_tls_unbind(vpninfo);
+ 		gnutls_deinit(vpninfo->https_sess);
+ 		vpninfo->https_sess = NULL;
+ 	}
+--- a/gnutls-dtls.c
++++ b/gnutls-dtls.c
+@@ -19,6 +19,7 @@
+ #include <config.h>
+ 
+ #include "gnutls.h"
++#include "zxsec-glue.h"
+ 
+ #include <gnutls/dtls.h>
+ 
+@@ -521,6 +522,8 @@
+ 		}
+ 
+ 		vpninfo->dtls_state = DTLS_CONNECTED;
++		zxsec_glue_dtls_check(vpninfo);
++		vpninfo->zxsec_dtls_active = zxsec_glue_available();
+ 		str = get_gnutls_cipher(vpninfo->dtls_ssl);
+ 		if (str) {
+ 			const char *c;
+@@ -581,6 +584,8 @@
+ 
+ void dtls_ssl_free(struct openconnect_info *vpninfo)
+ {
++	zxsec_glue_dtls_disable();
++	vpninfo->zxsec_dtls_active = 0;
+ 	gnutls_deinit(vpninfo->dtls_ssl);
+ 
+ 	if (vpninfo->psk_cred) {
