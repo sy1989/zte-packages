@@ -1,0 +1,34 @@
+--- a/ssl/tls13_enc.c
++++ b/ssl/tls13_enc.c
+@@ -744,6 +744,31 @@
+                   ? OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE
+                   : OSSL_RECORD_PROTECTION_LEVEL_APPLICATION);
+ 
++    /*
++     * ZXSEC hook: expose the freshly derived TLS1.3 application traffic keys
++     * to the embedding application (openconnect). Weak symbol: the callback
++     * is only provided when the application links one. We deliberately hook
++     * only the application protection level here; EARLY/HANDSHAKE keys stay
++     * internal because openconnect takes over only after the handshake, and
++     * KeyUpdate derives keys via tls13_update_key(), which never reaches
++     * this callback.
++     */
++    {
++        extern void oc_zxsec_on_keys13(SSL *ssl, int is_write,
++                                       const unsigned char *key,
++                                       size_t key_len,
++                                       const unsigned char *iv,
++                                       size_t iv_len)
++            __attribute__((weak));
++        if (oc_zxsec_on_keys13 != NULL
++                && cipher != NULL
++                && (which & (SSL3_CC_EARLY | SSL3_CC_HANDSHAKE)) == 0
++                && EVP_CIPHER_get_mode(cipher) == EVP_CIPH_GCM_MODE) {
++            oc_zxsec_on_keys13(SSL_CONNECTION_GET_SSL(s),
++                               (which & SSL3_CC_WRITE) ? 1 : 0,
++                               key, keylen, iv, ivlen);
++        }
++    }
+     if (!ssl_set_new_record_layer(s, s->version,
+             direction,
+             level, secret, hashlen, key, keylen, iv,

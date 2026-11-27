@@ -12,11 +12,13 @@ config OPENCONNECT_GNUTLS
 	help
 	  Build against GnuTLS and enable the same ZXSEC batch record layer
 	  as the OpenSSL backend. The gnutls package in this feed patches
-	  _gnutls_set_keys() to export final TLS1.2/DTLS1.2 GCM keys and the
-	  current record sequence number; openconnect then takes over DTLS
-	  and CSTP/TCP records and submits them with SUBMIT_BATCH.
+	  _gnutls_set_keys() (TLS1.2/DTLS1.2) and _tls13_set_keys()
+	  (TLS1.3) to export the final GCM keys plus the current record
+	  sequence number; openconnect then takes over DTLS (DTLS1.2) and
+	  CSTP/TCP records (TLS1.2 and TLS1.3) and submits them with
+	  SUBMIT_BATCH.
 
-	  Requires libgnutls from this feed (with the key-hook patch).
+	  Requires libgnutls from this feed (with the key-hook patches).
 	  Runtime fallback: ZXSEC_DISABLE=1 keeps the stock GnuTLS data path.
 
 config OPENCONNECT_OPENSSL
@@ -28,8 +30,10 @@ config OPENCONNECT_OPENSSL
 	  /dev/zx279133-sec with SUBMIT_BATCH (up to 16 per ioctl).
 
 	  Requires libs/openssl from this feed (or an OpenSSL 3.5.7 tree
-	  carrying patches/160-zxsec-tls12-keyhook.patch). Without that
-	  key hook the record layer stays inactive and openconnect falls
+	  carrying the 160/170 key-hook patches). CSTP is taken over for
+	  both TLS1.2 and TLS1.3 (AES-GCM); DTLS stays DTLS1.2 (DTLS1.3
+	  is not negotiated by ocserv/openconnect). Without those key
+	  hooks the record layer stays inactive and openconnect falls
 	  back to the native OpenSSL path automatically.
 
 endchoice

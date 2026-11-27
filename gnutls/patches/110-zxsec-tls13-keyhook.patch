@@ -1,0 +1,41 @@
+--- a/lib/constate.c
++++ b/lib/constate.c
+@@ -591,6 +591,38 @@
+ 		stage == STAGE_HS ? GNUTLS_ENCRYPTION_LEVEL_HANDSHAKE :
+ 				    GNUTLS_ENCRYPTION_LEVEL_APPLICATION;
+ 
++
++	/* ZXSEC: expose the TLS1.3 application traffic keys to openconnect's
++	 * out-of-tree batch record layer.  Only STAGE_APP is handed over --
++	 * handshake-stage keys stay internal (openconnect takes over after
++	 * the handshake), and KeyUpdate (STAGE_UPD_*) goes through
++	 * _tls13_update_keys() and never reaches here. */
++	{
++		extern void oc_zxsec_gnutls13_on_keys(void *session, int is_write,
++					    const unsigned char *key,
++					    unsigned key_len,
++					    const unsigned char *iv,
++					    unsigned iv_len,
++					    int cipher_id, int is_app)
++			__attribute__((weak));
++
++		if (oc_zxsec_gnutls13_on_keys != NULL && params->cipher != NULL &&
++		    client_write->key_size > 0 && client_write->iv_size > 0) {
++			int ours = (session->security_parameters.entity == GNUTLS_CLIENT);
++			int is_app = (stage == STAGE_APP);
++
++			/* openconnect is a client: client_write == write direction */
++			oc_zxsec_gnutls13_on_keys(session, ours ? 1 : 0,
++					client_write->key, client_write->key_size,
++					client_write->iv, client_write->iv_size,
++					(int)params->cipher->id, is_app);
++			oc_zxsec_gnutls13_on_keys(session, ours ? 0 : 1,
++					server_write->key, server_write->key_size,
++					server_write->iv, server_write->iv_size,
++					(int)params->cipher->id, is_app);
++		}
++	}
++
+ 	return 0;
+ }
+ 

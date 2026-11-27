@@ -8,11 +8,15 @@
 
 struct openconnect_info;
 
-/* GnuTLS 动态库通过弱符号调用它；OpenSSL 构建里只是未使用的声明。 */
+/* GnuTLS 动态库通过弱符号调用它们；OpenSSL 构建里只是未使用的声明。 */
 void oc_zxsec_gnutls_on_keys(void *session, int is_dtls, int epoch,
 			     int is_write, const unsigned char *key,
 			     size_t key_len, const unsigned char *iv,
 			     size_t iv_len, int cipher_id, int version_id);
+void oc_zxsec_gnutls13_on_keys(void *session, int is_write,
+			       const unsigned char *key, unsigned key_len,
+			       const unsigned char *iv, unsigned iv_len,
+			       int cipher_id, int is_app);
 
 int  zxsec_glue_available(void);
 void zxsec_glue_dtls_init(struct openconnect_info *vpninfo);

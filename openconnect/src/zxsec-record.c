@@ -55,6 +55,9 @@ struct zxrec_dir {
     int      alg_bit;
     int      keylen;
     uint8_t  key[32];
+    /* TLS1.3：nonce = iv13 XOR seq（RFC 8446），无显式 nonce、无 salt */
+    int      tls13;
+    uint8_t  iv13[ZXREC_IV13_LEN];
 };
 
 struct zxsec_rl {
@@ -183,6 +186,7 @@ int zxsec_rl_set_key(struct zxsec_rl *rl, int dir,
     memcpy(d->key, key, keylen);
     memcpy(d->salt, salt, ZXREC_SALT_LEN);
     d->epoch = epoch;
+    d->tls13 = 0;
     /* 新密钥 = 新序号空间。写方向两种传输都必须从 1 起：
      * libssl 已经用新密钥、seq 0 发过 Finished，若自管记录层也从 0 开始，
      * DTLS 服务端的重放窗口会把记录当重复包丢弃；TLS 服务端则会因为
@@ -190,6 +194,33 @@ int zxsec_rl_set_key(struct zxsec_rl *rl, int dir,
      * 读方向：DTLS 的 seq 在报文头里，TLS 从记录体内的显式 nonce 取，
      * 都不依赖这个计数器。 */
     d->seq = dir ? 1 : 0;
+    if (rl_alloc_sess(rl, d))
+        return -EIO;
+    d->have_key = 1;
+    return 0;
+}
+
+int zxsec_rl_set_key13(struct zxsec_rl *rl, int dir,
+                       const uint8_t *key, int keylen,
+                       const uint8_t *iv12)
+{
+    struct zxrec_dir *d = dir ? &rl->w : &rl->r;
+
+    if (keylen != 16 && keylen != 32)
+        return -EINVAL;
+    /* TLS1.3 只走 CSTP/TCP 通道 */
+    rl->is_dtls = 0;
+    d->keylen  = keylen;
+    d->alg_bit = (keylen == 16) ? ZXSEC_ALG_AES128_GCM_BIT
+                                : ZXSEC_ALG_AES256_GCM_BIT;
+    memcpy(d->key, key, keylen);
+    memcpy(d->iv13, iv12, ZXREC_IV13_LEN);
+    d->epoch = 0;
+    d->tls13 = 1;
+    /* TLS1.3 的 application traffic key 是全新的密钥空间，且没有
+     * CCS-清零这种事：client Finished 用的是 handshake traffic key
+     *（另一把 key），应用数据两方向都从 seq 0 起。 */
+    d->seq = 0;
     if (rl_alloc_sess(rl, d))
         return -EIO;
     d->have_key = 1;
@@ -213,6 +244,19 @@ static void build_nonce(const struct zxrec_dir *d, uint8_t *nonce12,
         nonce12[ZXREC_SALT_LEN + i] = (uint8_t)(seq8 >> (56 - 8 * i));
 }
 
+/* TLS1.3：nonce = static_iv XOR left_pad_12(seq)（RFC 8446 §5.2）。
+ * seq 右对齐填 8 字节、左边补 4 字节 0 后与 iv13 逐字节 XOR。 */
+static void build_nonce13(const struct zxrec_dir *d, uint8_t *nonce12,
+                          uint64_t seq)
+{
+    uint8_t pad[ZXREC_IV13_LEN] = { 0 };
+
+    for (int i = 0; i < 8; i++)
+        pad[4 + i] = (uint8_t)(seq >> (56 - 8 * i));
+    for (int i = 0; i < ZXREC_IV13_LEN; i++)
+        nonce12[i] = d->iv13[i] ^ pad[i];
+}
+
 /* seq8: TLS = 内部计数器；DTLS = epoch<<48 | seq48 */
 static void build_aad(uint8_t aad[ZXREC_AAD_LEN], uint64_t seq8,
                       size_t ct_len, int is_dtls)
@@ -224,6 +268,17 @@ static void build_aad(uint8_t aad[ZXREC_AAD_LEN], uint64_t seq8,
     aad[10] = is_dtls ? VER_DTLS12_LO : VER_TLS12_LO;
     aad[11] = (uint8_t)(ct_len >> 8);
     aad[12] = (uint8_t)(ct_len & 0xff);
+}
+
+/* TLS1.3：AAD 就是这条记录自己的 5B 记录头（opaque_type=0x17,
+ * legacy_version=0x0303, uint16 length = 密文+tag）。 */
+static void build_aad13(uint8_t aad[ZXREC_AAD13_LEN], size_t body_len)
+{
+    aad[0] = REC_APPDATA;
+    aad[1] = VER_TLS12_HI;
+    aad[2] = VER_TLS12_LO;
+    aad[3] = (uint8_t)(body_len >> 8);
+    aad[4] = (uint8_t)(body_len & 0xff);
 }
 
 /* ---------------- 批量提交核心 ---------------- */
@@ -321,6 +376,7 @@ int zxsec_rl_seal(struct zxsec_rl *rl, int is_dtls,
     uint32_t slot_base[ZXREC_MAX_BATCH];
     size_t ct_len[ZXREC_MAX_BATCH];
     uint8_t *cursor = out;
+    int tls13 = !is_dtls && d->tls13;
     int ret;
 
     if (!d->have_key) {
@@ -344,13 +400,29 @@ int zxsec_rl_seal(struct zxsec_rl *rl, int is_dtls,
         ct_len[i] = in[i].iov_len;
 
         uint8_t *slot = rl->arena + slot_base[i];
-        build_aad(slot, seq8[i], ct_len[i], is_dtls);
-        memcpy(slot + ZXREC_AAD_OFF, in[i].iov_base, in[i].iov_len);
 
-        uint8_t nonce12[ZXREC_NONCE_LEN];
-        build_nonce(d, nonce12, seq8[i]);
-        rl_fill_req(&reqs[i], d->sess_id, slot_base[i], ct_len[i],
-                    nonce12, ZXREC_AAD_LEN, 0);
+        if (tls13) {
+            /* TLS1.3 明文 = payload ‖ inner_content_type(0x17)，无 padding。
+             * 密文长度 = 明文长度；记录体 = 密文 ‖ tag（无显式 nonce）。 */
+            ct_len[i] = in[i].iov_len + 1;
+            memcpy(slot + ZXREC_AAD_OFF, in[i].iov_base, in[i].iov_len);
+            slot[ZXREC_AAD_OFF + in[i].iov_len] = REC_APPDATA;
+            build_aad13((uint8_t *)slot, ct_len[i] + ZXREC_TAG_LEN);
+        } else {
+            build_aad(slot, seq8[i], ct_len[i], is_dtls);
+            memcpy(slot + ZXREC_AAD_OFF, in[i].iov_base, in[i].iov_len);
+        }
+
+        {
+            uint8_t nonce12[ZXREC_NONCE_LEN];
+
+            if (tls13)
+                build_nonce13(d, nonce12, seq8[i]);
+            else
+                build_nonce(d, nonce12, seq8[i]);
+            rl_fill_req(&reqs[i], d->sess_id, slot_base[i], ct_len[i],
+                        nonce12, tls13 ? ZXREC_AAD13_LEN : ZXREC_AAD_LEN, 0);
+        }
         d->seq++;                       /* TLS 计数器跨记录递增 */
     }
 
@@ -360,9 +432,16 @@ int zxsec_rl_seal(struct zxsec_rl *rl, int is_dtls,
     rl->seal_ops += (unsigned long)n;
 
     for (int i = 0; i < n; i++) {
-        size_t rec_payload = ct_len[i] + ZXREC_EXPLICIT_IV_LEN + ZXREC_TAG_LEN;
-        size_t rec_total = (is_dtls ? ZXREC_DTLS_HDR_LEN : ZXREC_TLS_HDR_LEN)
-                           + rec_payload;
+        size_t rec_payload, rec_total;
+
+        if (tls13) {
+            rec_payload = ct_len[i] + ZXREC_TAG_LEN;
+            rec_total = ZXREC_TLS_HDR_LEN + rec_payload;
+        } else {
+            rec_payload = ct_len[i] + ZXREC_EXPLICIT_IV_LEN + ZXREC_TAG_LEN;
+            rec_total = (is_dtls ? ZXREC_DTLS_HDR_LEN : ZXREC_TLS_HDR_LEN)
+                        + rec_payload;
+        }
 
         if ((size_t)(cursor - out) + rec_total > outcap)
             return -ENOBUFS;
@@ -384,6 +463,7 @@ int zxsec_rl_seal(struct zxsec_rl *rl, int is_dtls,
             h[11] = (uint8_t)(rec_payload >> 8);
             h[12] = (uint8_t)(rec_payload & 0xff);
         } else {
+            /* TLS1.2 与 TLS1.3 的明文记录头完全同型：0x17,0x0303,len */
             cursor[0] = REC_APPDATA;
             cursor[1] = VER_TLS12_HI;
             cursor[2] = VER_TLS12_LO;
@@ -394,15 +474,21 @@ int zxsec_rl_seal(struct zxsec_rl *rl, int is_dtls,
             uint8_t *dst = cursor + (is_dtls ? ZXREC_DTLS_HDR_LEN
                                              : ZXREC_TLS_HDR_LEN);
             uint8_t *slot = rl->arena + slot_base[i];
-            uint64_t sn = seq8[i];
-            /* 记录体 = 显式 nonce(8) || 密文 || tag。显式部分就是 seq
-             * （DTLS 为 epoch||seq48），必须与实际加密用的 nonce 一致，
-             * 对端靠它重建 12 字节 nonce。漏写会让对端把密文前 8 字节
-             * 当成 nonce，整条记录解密失败。 */
-            for (int k = 0; k < ZXREC_EXPLICIT_IV_LEN; k++)
-                dst[k] = (uint8_t)(sn >> (56 - 8 * k));
-            memcpy(dst + ZXREC_EXPLICIT_IV_LEN, slot + ZXREC_AAD_OFF,
-                   ct_len[i] + ZXREC_TAG_LEN);
+
+            if (tls13) {
+                /* 记录体 = 密文 ‖ tag（1.3 无显式 nonce） */
+                memcpy(dst, slot + ZXREC_AAD_OFF, rec_payload);
+            } else {
+                uint64_t sn = seq8[i];
+                /* 记录体 = 显式 nonce(8) || 密文 || tag。显式部分就是 seq
+                 * （DTLS 为 epoch||seq48），必须与实际加密用的 nonce 一致，
+                 * 对端靠它重建 12 字节 nonce。漏写会让对端把密文前 8 字节
+                 * 当成 nonce，整条记录解密失败。 */
+                for (int k = 0; k < ZXREC_EXPLICIT_IV_LEN; k++)
+                    dst[k] = (uint8_t)(sn >> (56 - 8 * k));
+                memcpy(dst + ZXREC_EXPLICIT_IV_LEN, slot + ZXREC_AAD_OFF,
+                       ct_len[i] + ZXREC_TAG_LEN);
+            }
         }
         if (dgram_out && i < max_dgrams) {
             dgram_out[i].iov_base = cursor;
@@ -525,13 +611,15 @@ int zxsec_rl_open_dtls(struct zxsec_rl *rl,
 
 int zxsec_rl_open_tls(struct zxsec_rl *rl,
                       const struct iovec *in, int n,
-                      struct iovec *out, int *out_lens)
+                      struct iovec *out, int *out_lens,
+                      uint8_t *types)
 {
     struct zxrec_dir *d = &rl->r;
     struct zxsec_op_request reqs[ZXREC_MAX_BATCH];
     uint32_t slot_base[ZXREC_MAX_BATCH];
     size_t ct_len[ZXREC_MAX_BATCH];
     uint64_t seq8[ZXREC_MAX_BATCH];
+    int tls13 = d->tls13;
 
     if (!d->have_key)
         return -EINVAL;
@@ -546,50 +634,88 @@ int zxsec_rl_open_tls(struct zxsec_rl *rl,
             ZXDBG("open_tls[%d]: bad head type=%02x len=%zu\n", i, p[0], len);
             return -EBADMSG;
         }
-        /* 头部 payload = 显式 nonce + 密文 + tag（GCM：密文长 = 明文长） */
-        {
+        if (tls13) {
+            /* TLS1.3 记录体 = 密文 ‖ tag，长度就是头里的 2B 字段 */
+            size_t body = ((size_t)p[3] << 8) | p[4];
+
+            if (body < ZXREC_TAG_LEN + 1) {
+                /* 至少要装得下 inner content type + tag */
+                ZXDBG("open_tls[%d]: short body %zu\n", i, body);
+                return -EBADMSG;
+            }
+            ct_len[i] = body - ZXREC_TAG_LEN;
+            if (len != ZXREC_TLS_HDR_LEN + body) {
+                ZXDBG("open_tls[%d]: len mismatch ct=%zu rec=%zu\n",
+                      i, ct_len[i], len - ZXREC_TLS_HDR_LEN);
+                return -EBADMSG;
+            }
+            if (ct_len[i] > rl->max_data) {
+                ZXDBG("open_tls[%d]: ct too big %zu\n", i, ct_len[i]);
+                return -EINVAL;
+            }
+            /* 读方向没有显式 nonce：用内部计数器。批内逐条递增
+             * （1.2 路径从记录里的显式 nonce 逐条重放，1.3 只能靠计数器，
+             * 漏掉 +i 会让同批记录共用同一 nonce，第一条之后全部 tag 失败） */
+            seq8[i] = d->seq + (uint64_t)i;
+        } else {
+            /* 头部 payload = 显式 nonce + 密文 + tag（GCM：密文长 = 明文长） */
             size_t body = ((size_t)p[3] << 8) | p[4];
             if (body < ZXREC_EXPLICIT_IV_LEN + ZXREC_TAG_LEN) {
                 ZXDBG("open_tls[%d]: short body %zu\n", i, body);
                 return -EBADMSG;
             }
             ct_len[i] = body - ZXREC_EXPLICIT_IV_LEN - ZXREC_TAG_LEN;
-        }
-        if (len != ZXREC_TLS_HDR_LEN + ZXREC_EXPLICIT_IV_LEN
-                   + ct_len[i] + ZXREC_TAG_LEN) {
-            ZXDBG("open_tls[%d]: len mismatch ct=%zu rec=%zu\n",
-                  i, ct_len[i], len - ZXREC_TLS_HDR_LEN);
-            return -EBADMSG;
-        }
-        if ((ssize_t)ct_len[i] < 0) {
-            ZXDBG("open_tls[%d]: payload < tag\n", i);
-            return -EBADMSG;
-        }
-        if (ct_len[i] > rl->max_data) {
-            ZXDBG("open_tls[%d]: ct too big %zu\n", i, ct_len[i]);
-            return -EINVAL;
-        }
+            if (len != ZXREC_TLS_HDR_LEN + ZXREC_EXPLICIT_IV_LEN
+                       + ct_len[i] + ZXREC_TAG_LEN) {
+                ZXDBG("open_tls[%d]: len mismatch ct=%zu rec=%zu\n",
+                      i, ct_len[i], len - ZXREC_TLS_HDR_LEN);
+                return -EBADMSG;
+            }
+            if ((ssize_t)ct_len[i] < 0) {
+                ZXDBG("open_tls[%d]: payload < tag\n", i);
+                return -EBADMSG;
+            }
+            if (ct_len[i] > rl->max_data) {
+                ZXDBG("open_tls[%d]: ct too big %zu\n", i, ct_len[i]);
+                return -EINVAL;
+            }
 
-        /* 显式 nonce 就是 seq，直接以记录内的为准，避免计数器漂移 */
-        {
-            uint64_t s = 0;
-            for (int k = 0; k < ZXREC_EXPLICIT_IV_LEN; k++)
-                s = (s << 8) | p[ZXREC_TLS_HDR_LEN + k];
-            seq8[i] = s;
-            d->seq = s + 1;
+            /* 显式 nonce 就是 seq，直接以记录内的为准，避免计数器漂移 */
+            {
+                uint64_t s = 0;
+                for (int k = 0; k < ZXREC_EXPLICIT_IV_LEN; k++)
+                    s = (s << 8) | p[ZXREC_TLS_HDR_LEN + k];
+                seq8[i] = s;
+                d->seq = s + 1;
+            }
         }
         slot_base[i] = (uint32_t)i * rl->slot_size;
         uint8_t *slot = rl->arena + slot_base[i];
-        build_aad(slot, seq8[i], ct_len[i], 0);
+        if (tls13) {
+            /* AAD = 这条记录的 5B 记录头原样（0x17,0303,len 已在线上） */
+            memcpy(slot, p, ZXREC_AAD13_LEN);
+        } else {
+            build_aad(slot, seq8[i], ct_len[i], 0);
+        }
         memcpy(slot + ZXREC_AAD_OFF,
-               p + ZXREC_TLS_HDR_LEN + ZXREC_EXPLICIT_IV_LEN,
+               p + ZXREC_TLS_HDR_LEN
+                 + (tls13 ? 0 : ZXREC_EXPLICIT_IV_LEN),
                ct_len[i] + ZXREC_TAG_LEN);
 
-        uint8_t nonce12[ZXREC_NONCE_LEN];
-        build_nonce(d, nonce12, seq8[i]);
-        rl_fill_req(&reqs[i], d->sess_id, slot_base[i], ct_len[i],
-                    nonce12, ZXREC_AAD_LEN, 1);
+        {
+            uint8_t nonce12[ZXREC_NONCE_LEN];
+
+            if (tls13)
+                build_nonce13(d, nonce12, seq8[i]);
+            else
+                build_nonce(d, nonce12, seq8[i]);
+            rl_fill_req(&reqs[i], d->sess_id, slot_base[i], ct_len[i],
+                        nonce12,
+                        tls13 ? ZXREC_AAD13_LEN : ZXREC_AAD_LEN, 1);
+        }
     }
+    if (tls13)
+        d->seq += (uint64_t)n;          /* 本批消耗的序号 */
 
     int ret = rl_submit(rl, reqs, n);
     if (ret)
@@ -601,7 +727,8 @@ int zxsec_rl_open_tls(struct zxsec_rl *rl,
         for (int i = 0; i < n; i++) {
             const uint8_t *wire_tag = (const uint8_t *)in[i].iov_base
                                       + ZXREC_TLS_HDR_LEN
-                                      + ZXREC_EXPLICIT_IV_LEN + ct_len[i];
+                                      + (tls13 ? 0 : ZXREC_EXPLICIT_IV_LEN)
+                                      + ct_len[i];
             const uint8_t *hw_tag = rl->arena + slot_base[i] + ZXREC_AAD_OFF + ct_len[i];
             if (memcmp(hw_tag, wire_tag, ZXREC_TAG_LEN) != 0) {
                 ZXDBG("open_tls[%d]: tag mismatch (seq %llu)\n",
@@ -621,8 +748,28 @@ int zxsec_rl_open_tls(struct zxsec_rl *rl,
         }
     }
     for (int i = 0; i < n; i++) {
-        out[i].iov_base = rl->arena + slot_base[i] + ZXREC_AAD_OFF;
-        out_lens[i] = (int)ct_len[i];
+        const uint8_t *plain = rl->arena + slot_base[i] + ZXREC_AAD_OFF;
+
+        out[i].iov_base = (void *)plain;
+        if (tls13) {
+            /* TLS1.3 明文 = inner_content_type ‖ payload ‖ padding(0..)。
+             * 最后一个非 0 字节是 inner type，其前全部是有效 payload。 */
+            ssize_t idx = (ssize_t)ct_len[i] - 1;
+
+            while (idx >= 0 && plain[idx] == 0)
+                idx--;
+            if (idx < 0) {
+                ZXDBG("open_tls[%d]: TLS1.3 empty inner type\n", i);
+                return -EBADMSG;
+            }
+            if (types)
+                types[i] = plain[idx];
+            out_lens[i] = (int)idx;
+        } else {
+            if (types)
+                types[i] = REC_APPDATA;
+            out_lens[i] = (int)ct_len[i];
+        }
     }
     return 0;
 }

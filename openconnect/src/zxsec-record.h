@@ -26,8 +26,10 @@
 #define ZXREC_TAG_LEN     16
 #define ZXREC_SALT_LEN    4
 #define ZXREC_EXPLICIT_IV_LEN 8   /* TLS/DTLS 1.2 AEAD 记录体内的显式 nonce */
+#define ZXREC_IV13_LEN    12      /* TLS1.3 write_iv（static IV）长度 */
 #define ZXREC_NONCE_LEN   12
-#define ZXREC_AAD_LEN     13
+#define ZXREC_AAD_LEN     13      /* TLS1.2: seq(8)||type||ver||len */
+#define ZXREC_AAD13_LEN   5       /* TLS1.3: AAD 就是 5B 记录头 */
 #define ZXREC_TLS_HDR_LEN 5
 #define ZXREC_DTLS_HDR_LEN 13
 /* 一条 TLS1.2 AEAD 记录的固定开销：5B 头 + 8B 显式 nonce + 16B tag */
@@ -50,6 +52,19 @@ void zxsec_rl_close(struct zxsec_rl *rl);
 int zxsec_rl_set_key(struct zxsec_rl *rl, int dir,
                      const uint8_t *key, int keylen,
                      const uint8_t *salt, uint16_t epoch, int is_dtls);
+
+/*
+ * TLS1.3 版密钥安装（RFC 8446 application traffic key）：
+ *   dir:      0 = 读方向，1 = 写方向
+ *   keylen:   16 或 32（AES-128/256-GCM）
+ *   iv12:     12 字节 static IV（TLS1.3 没有 4B salt 的概念）
+ * 安装后该方向走 TLS1.3 记录格式（见下），序号两方向都从 0 起
+ * （application traffic key 是全新的密钥空间）。只用于 CSTP/TCP 通道；
+ * DTLS 侧始终 DTLS1.2（ocserv/openconnect 不协商 DTLS1.3）。
+ */
+int zxsec_rl_set_key13(struct zxsec_rl *rl, int dir,
+                       const uint8_t *key, int keylen,
+                       const uint8_t *iv12);
 
 /* 覆盖当前序号计数器（GnuTLS 握手完成后需要按它的 sequence_number 对齐；
  * OpenSSL 路径不需要调用，set_key() 的默认行为保持原样）。 */
@@ -78,12 +93,19 @@ int zxsec_rl_open_dtls(struct zxsec_rl *rl,
 
 /*
  * 批量解密（CSTP/TLS）：in = 连续字节流切片（已按 5B 记录头切好，
- * 记录含头），n 条记录一次解密。seq 由内部读方向计数器维护。
+ * 记录含头），n 条记录一次解密。
+ * TLS1.2：seq 来自记录体内的显式 nonce；types[i] = 记录头 type。
+ * TLS1.3（set_key13 安装后）：seq 用内部计数器（两方向都从 0 起）；
+ *   外层记录头恒为 0x17，真正的类型加密在明文尾部——解密后从明文尾部
+ *   找最后一个非 0 字节填入 types[i]（0x17=数据，0x15=alert，
+ *   0x16=handshake/KeyUpdate），out_lens[i] 为去掉类型与 padding 后的
+ *   有效明文长度。types 可传 NULL（1.2 下忽略）。
  * 输出 out[i] = 记录明文（不含 5B 头）。
  */
 int zxsec_rl_open_tls(struct zxsec_rl *rl,
                       const struct iovec *in, int n,
-                      struct iovec *out, int *out_lens);
+                      struct iovec *out, int *out_lens,
+                      uint8_t *types);
 
 /* 从连续缓冲里解析出完整记录（含头），返回消耗的字节数；
  * recs[i] 指向记录头起始。rec_n 上限 ZXREC_MAX_BATCH。

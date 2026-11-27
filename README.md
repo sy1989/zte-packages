@@ -4,9 +4,9 @@ ZTE SG350H（ZX279133）安全引擎（ZXSEC）相关的 OpenWrt 软件包，按
 
 | 目录 | 包 | 说明 |
 |---|---|---|
-| `openssl/` | `libopenssl`（core 包） | OpenSSL 3.5.7，额外带一个 TLS1.2/DTLS1.2 密钥回调钩子（弱符号，不影响未链接回调的程序）。 |
-| `openconnect/` | `openconnect` | OpenConnect 9.12，DTLS 与 CSTP(TCP) 数据面可选由自管记录层接管，通过 `/dev/zx279133-sec` 的 `SUBMIT_BATCH` 批量加解密（≤16 条/次），线上格式不变。 |
-| `gnutls/` | `libgnutls` | GnuTLS 3.8.10，带 `_gnutls_set_keys()` 密钥钩子和记录序号导出补丁；openconnect 的 GnuTLS 后端靠它把 DTLS/CSTP 记录交给 ZXSEC。 |
+| `openssl/` | `libopenssl`（core 包） | OpenSSL 3.5.7，额外带两个 TLS 密钥回调钩子（弱符号，不影响未链接回调的程序）：160 号暴露 TLS1.2/DTLS1.2 密钥，170 号暴露 TLS1.3 application traffic key + 12B static IV。 |
+| `openconnect/` | `openconnect` | OpenConnect 9.12，DTLS 与 CSTP(TCP) 数据面可选由自管记录层接管，通过 `/dev/zx279133-sec` 的 `SUBMIT_BATCH` 批量加解密（≤16 条/次），线上格式不变。CSTP 同时支持 TLS1.2 与 TLS1.3（AES-GCM），DTLS 走 DTLS1.2。 |
+| `gnutls/` | `libgnutls` | GnuTLS 3.8.10，带 `_gnutls_set_keys()`（TLS1.2/DTLS1.2）与 `_tls13_set_keys()`（TLS1.3）两个密钥钩子和记录序号导出补丁；openconnect 的 GnuTLS 后端靠它把 DTLS/CSTP 记录交给 ZXSEC。 |
 
 > openconnect 的 `DEPENDS` 里有 `+vpnc-scripts`（提供 `/lib/netifd/vpnc-script`），这个包来自官方 packages feed，本仓库不收录。
 
@@ -45,8 +45,9 @@ gnutls/
 ├── Makefile
 ├── Config.in
 └── patches/
-    ├── 010..030           # 上游 OpenWrt 补丁（未改动）
-    └── 100-zxsec-key-hook.patch  # 本项目新增：导出 TLS1.2 密钥与记录序号
+    ├── 010..030            # 上游 OpenWrt 补丁（未改动）
+    ├── 100-zxsec-key-hook.patch  # 本项目新增：导出 TLS1.2 密钥与记录序号
+    └── 110-zxsec-tls13-keyhook.patch  # 本项目新增：导出 TLS1.3 application key + 12B IV
 ```
 
 三个包目录各自带 `Makefile`，仓库根目录不需要额外 Makefile（OpenWrt feed 只要求包目录里有 Makefile，扫描深度 5 层）。
@@ -74,7 +75,7 @@ sh /path/to/zte-packages/setup-feed.sh /path/to/zte-packages
    `openconnect` / `gnutls`，不指定就会抢先被选中）。
 4. 整目录替换 core 包 `package/libs/openssl`（feed 的同名包覆盖不了 core 包）。
 
-脚本末尾会打印 11 项 PASS/FAIL：验证 `package/feeds/zte/` 下的链接确实指向本仓库、
+脚本末尾会打印 13 项 PASS/FAIL：验证 `package/feeds/zte/` 下的链接确实指向本仓库、
 没有官方同名链接残留、三个包的版本钉死、三个关键补丁都在、双后端选项存在。
 **有任何 FAIL 就不要继续编译**，按提示检查 `feeds.conf` 和链接指向。
 
@@ -100,7 +101,7 @@ rm -f package/feeds/*/openconnect package/feeds/*/gnutls package/feeds/*/libgnut
 | 选项 | 说明 |
 |---|---|
 | `GnuTLS + ZXSEC record layer (default)`（默认） | DTLS 与 CSTP/TCP 都走批量记录层。依赖本仓库 `gnutls/`（带密钥钩子）和 `libtasn1`。运行时 `ZXSEC_DISABLE=1` 可回退到原生 GnuTLS 数据面。 |
-| `OpenSSL + ZXSEC record layer` | 同样的批量记录层，密钥来自本仓库 `openssl/` 的 TLS1.2 key hook。 |
+| `OpenSSL + ZXSEC record layer` | 同样的批量记录层，密钥来自本仓库 `openssl/` 的 TLS1.2/TLS1.3 key hook（160/170 号补丁）。 |
 
 两个后端默认都启用硬件加速；切换后端仍会触发重新编译（`PKG_CONFIG_DEPENDS`）。
 两个后端是同一个包的两个构建分支，切后端会触发重新编译（`PKG_CONFIG_DEPENDS`），但**不会**自动清 build_dir，切换后建议 `make package/openconnect/clean` 一次。
@@ -167,8 +168,25 @@ extern void oc_zxsec_on_keys(SSL *, int is_dtls, int is_write, uint16_t epoch,
         __attribute__((weak));
 ```
 
-- 仅 TLS≤1.2 且 `EVP_CIPH_GCM_MODE` 时触发；TLS1.3 走另一条路径，不会被接管。
+- 仅 TLS≤1.2 且 `EVP_CIPH_GCM_MODE` 时触发；TLS1.3 走 `tls13_change_cipher_state()`，由 170 号补丁另行挂钩。
 - 没链接回调时行为与官方 OpenSSL 完全一致。
+
+### openssl：TLS1.3 密钥钩子（170 号补丁）
+
+`ssl/tls13_enc.c` 的 `tls13_change_cipher_state()` 末尾、`ssl_set_new_record_layer()`
+之前插入，只在 **application 保护级别**（`(which & (SSL3_CC_EARLY|SSL3_CC_HANDSHAKE)) == 0`）
+且 GCM 时触发，把 key + 12B static IV 交给弱符号回调：
+
+```c
+extern void oc_zxsec_on_keys13(SSL *, int is_write,
+                               const unsigned char *key, size_t key_len,
+                               const unsigned char *iv, size_t iv_len)
+        __attribute__((weak));
+```
+
+- handshake/early traffic key 不经过回调（接管点在握手完成之后，用不到它们）；
+- KeyUpdate 换 key 走 `tls13_update_key()`，同样不经过回调——记录层读方向遇到
+  inner handshake 记录会断线重连，所以收不到 rekey 也不会错乱。
 
 ### openconnect：接管 DTLS 数据面
 
@@ -181,12 +199,13 @@ extern void oc_zxsec_on_keys(SSL *, int is_dtls, int is_write, uint16_t epoch,
 
 ### openconnect：CSTP/TCP 通道（150 号补丁）
 
-DTLS 之外，CSTP（TCP 443 上的 TLS1.2）也接了同一套记录层，做法比 DTLS 简单：
+DTLS 之外，CSTP（TCP 443 上的 TLS）也接了同一套记录层，做法比 DTLS 简单：
 
 - 接管点在 `openssl.c` 的 `openconnect_openssl_connect()` 尾部——TLS 握手刚完成、
   认证 POST 还没发。`zxsec_glue_tls_bind()` 在那里装 key、做 gate 检查
-  （TLS1.2 + AES-GCM）；`openconnect_close_https()` 里 `zxsec_glue_tls_unbind()`
-  把状态清干净（否则下一个 `SSL *` 复用同一地址会被误判为已接管）；
+  （TLS1.2 或 TLS1.3 + AES-GCM，按密钥钩子送来的 key 形态自动区分）；`openconnect_close_https()` 里
+  `zxsec_glue_tls_unbind()` 把状态清干净（否则下一个 `SSL *` 复用同一地址会被
+  误判为已接管）；
 - `openssl.c` 的 `ssl_read/write/gets` 与 `ssl_nonblock_read/write` 在 `dtls=0`
   且已激活时转到 `zxsec_cstp_*()`，所以认证 POST、HTTP CONNECT、CSTP 数据、BYE
   全走记录层；
@@ -195,9 +214,11 @@ DTLS 之外，CSTP（TCP 443 上的 TLS1.2）也接了同一套记录层，做�
   EAGAIN 才发一次 `SUBMIT_BATCH`（对端没数据时第一次 top-up 就 EAGAIN，不增加延迟）。
   实测 42425 条记录只用了 2884 次提交，平均 14.7 条/批，84% 的批次满载 16 条；
 - 明文按记录排队，上层的 1 字节读（HTTP 响应头）直接从队列取，语义与 `SSL_read` 一致；
-- 写方向 seq 从 **1** 起（CCS 后 libssl 已用 seq 0 发过 Finished），之后所有
-  application_data 都经过本层；一次给超过 16KB（HTTP POST 正文）会按 16K 明文切块
-  封装，非阻塞没写完时保留记录、下次用同一块数据重试只续写不重封；
+- 写方向 seq 在 **TLS1.2 从 1 起**（CCS 后 libssl 已用 seq 0 发过 Finished）；**TLS1.3
+  两方向都从 0 起**（application traffic key 是全新密钥空间，client Finished 用的是
+  handshake traffic key，另一把 key）。之后所有 application_data 都经过本层；一次给
+  超过 16KB（HTTP POST 正文）会按 16K 明文切块封装，非阻塞没写完时保留记录、下次用
+  同一块数据重试只续写不重封；
 - 写方向同样做了攒批，但**不能合并记录**：`ssl_write` 一次只给一个隧道包，记录层
   在写首帧时顺手把 `outgoing_queue` 里已就绪的包一起取走（FIFO，取不下就 requeue），
   **每帧封一条记录、多条记录走同一次 `SUBMIT_BATCH`**。实测 30 Mbps 上行 1389 次提交
@@ -225,10 +246,13 @@ GnuTLS 走的是与 OpenSSL **相同的自管记录层**，不是注册 AEAD 后
 1. `gnutls/patches/100-zxsec-key-hook.patch` 在 `_gnutls_set_keys()` 末尾调用弱符号
    `oc_zxsec_gnutls_on_keys()`，把 TLS1.2/DTLS1.2 AES-GCM 的最终密钥、4 字节 salt、
    epoch 交给 openconnect；另外导出 `oc_zxsec_gnutls_get_seq()` 供握手后对齐写序号。
-   TLS1.3 走 `_tls13_set_keys()`，不会触发钩子。
-2. `openconnect/patches/140-gnutls-record-layer.patch` 在 `gnutls.c` 的 HTTP/CSTP 与
+2. `gnutls/patches/110-zxsec-tls13-keyhook.patch` 在 `_tls13_set_keys()` 末尾调用
+   弱符号 `oc_zxsec_gnutls13_on_keys()`，只在 `stage == STAGE_APP`（application
+   traffic key）且 AES-GCM 时把 key + 12B static IV 交给 openconnect——TLS1.3 的
+   CSTP 接管靠它。KeyUpdate（`STAGE_UPD_*`）走 `_tls13_update_keys()`，不会触发钩子。
+3. `openconnect/patches/140-gnutls-record-layer.patch` 在 `gnutls.c` 的 HTTP/CSTP 与
    `gnutls-dtls.c` 的 DTLS 握手完成点接管，读写全部转给同一套 `zxsec-glue.c`。
-3. `zxsec-glue.c` 用 `OPENCONNECT_OPENSSL` / `OPENCONNECT_GNUTLS` 条件编译区分
+4. `zxsec-glue.c` 用 `OPENCONNECT_OPENSSL` / `OPENCONNECT_GNUTLS` 条件编译区分
    会话对象和 gate 检查；`zxsec-record.c` 的 nonce/AAD/批量提交对两个后端完全一致。
    openconnect 链接时加 `-Wl,--export-dynamic`，让动态 `libgnutls.so` 能解析到
    可执行文件里的弱符号钩子。
@@ -280,6 +304,9 @@ ZXSEC: DTLS batch record layer ENABLED (AES-128-GCM)
 ZXSEC: CSTP batch record layer ENABLED (AES-128-GCM)
 ```
 
+协商出 TLS1.3 时 CSTP 那行显示 `TLS1.3-AES-128-GCM` / `TLS1.3-AES-256-GCM`
+（OpenSSL 后端为 `TLS_AES_128_GCM_SHA256` 等套件名）。
+
 OpenSSL 后端括号里显示的是 `SSL_CIPHER_get_name()`（例如 `ECDHE-RSA-AES128-GCM-SHA256`），GnuTLS 后端显示 `AES-128-GCM` / `AES-256-GCM`。
 
 回退到原生软件加密（同一个二进制）：
@@ -293,7 +320,8 @@ ZXSEC_DISABLE=1 openconnect ...
 ## 已知限制
 
 - ZXSEC 批量记录层在 **OpenSSL 与 GnuTLS 两个后端**都生效；GnuTLS 分支依赖本仓库打了密钥钩子的 `libgnutls`。
-- 只接管 **DTLS1.2 与 CSTP(TLS1.2) 的 AES-GCM**；TLS1.3、AES-CBC 套件仍走原生 libssl。
+- DTLS 只接管 **DTLS1.2 的 AES-GCM**；CSTP 接管 **TLS1.2 与 TLS1.3 的 AES-GCM**（TLS1.3 见下节）。AES-CBC 套件仍走原生 TLS 库。
+- TLS1.3 特有限制：nonce 是 XOR 派生、AAD 只有记录头、真实类型在密文内部，这些已由记录层的 1.3 分支处理；但 **KeyUpdate / post-handshake auth 不支持**——读方向解出 inner handshake 记录（0x16）会按连接错误断线重连，ocserv 默认不会主动发 KeyUpdate，长连接下基本不触发。
 - CSTP 写方向受服务端限制：一条 TLS 记录只能装一个 CSTP 帧，所以批量体现为“多条记录
   一次 `SUBMIT_BATCH`”，无法像 DTLS 那样把多包并成一条大记录；上行每帧仍是一条 ~1.4KB
   的记录，比 DOWN 方向的 ~1KB 记录条数更多，绝对 CPU 也略高。
@@ -303,6 +331,23 @@ ZXSEC_DISABLE=1 openconnect ...
 
 ## 升级版本时
 
-1. 改 `PKG_VERSION` / `PKG_HASH`；
-2. 按新源码重新生成补丁（早期用 `oc-zxsec-record/apply-dtls-batch.py`，它只覆盖 DTLS；仓库当前的 5 个补丁是 `D:/tmp/zte/replay.sh` 回放的基线）；
-3. `diff -u` 重新生成 **5 个**补丁，重点检查 `Makefile.in` 的 `am_libopenconnect_la_OBJECTS` 与 `libopenconnect_la-dtls.lo: dtls.c` 两个锚点，以及 150 号补丁在 `openssl.c: openconnect_openssl_connect()` 的接管点锚点是否还在。
+版本是钉死的（补丁针对具体源码生成），升级 = 换源码 + 重放补丁 + 重新验证：
+
+1. 先分清两种「更新」：只改本项目逻辑 → 动对应包的 `PKG_RELEASE`，不动 `PKG_VERSION`；
+   升级上游源码 → 走完整流程。
+2. 换官方基线（openssl 取 `openwrt/openwrt` 的 `package/libs/openssl`，另两个取
+   `openwrt/packages` 的 `net/openconnect`、`libs/gnutls`），整目录替换后先提交为
+   「官方基线」commit；
+3. 改 `PKG_VERSION` / `PKG_HASH`，同步 `setup-feed.sh` 里的版本检查和 README 的版本描述；
+4. 按新源码重放 **10 个本项目补丁**（openssl 160/170，gnutls 100/110，openconnect
+   100–150）：`patch -p1 --dry-run` 逐个试打，失败 hunk 手工对齐后重新 `diff -u`。
+   重点锚点：`Makefile.in` 的 `am_libopenconnect_la_OBJECTS` 与
+   `libopenconnect_la-dtls.lo: dtls.c`、150 号在 `openssl.c: openconnect_openssl_connect()`
+   的接管点、160 号在 `ssl/t1_enc.c: tls1_change_cipher_state()` 末尾、
+   170 号在 `ssl/tls13_enc.c: tls13_change_cipher_state()` 的
+   `ssl_set_new_record_layer()` 前、100/110 号在 `lib/constate.c` 的
+   `_gnutls_set_keys()` / `_tls13_set_keys()` 末尾；
+5. 只改 `Makefile.in`，绝不能同时改 `Makefile.am`（会触发 automake，SDK 里没有）；
+6. 双后端编译 + 符号验证（`readelf -sW openconnect | grep -c zxsec_`）+ 实机
+   A/B（`ZXSEC_DISABLE=1` 基线、30Mbps 定速），全部通过后再提交「我们的改动」commit；
+   由于重写历史，推送用 `git push --force-with-lease`。

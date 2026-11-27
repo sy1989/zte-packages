@@ -55,15 +55,20 @@ define Package/openconnect/description
 	  self-managed record layer that submits records to
 	  /dev/zx279133-sec in batches (SUBMIT_BATCH, up to 16 records per
 	  ioctl) while keeping the wire format unchanged. The CSTP/TCP
-	  channel uses the same record layer (one 16K TLS record per
-	  submit) once TLS1.2 + AES-GCM is negotiated. Needs the
-	  ZXSEC-enabled libssl from this feed; falls back to plain OpenSSL
-	  at run time (ZXSEC_DISABLE=1) or when the key hook is missing.
+	  channel uses the same record layer once TLS1.2 or TLS1.3 with
+	  AES-GCM is negotiated (TLS1.3: nonce = static_iv XOR seq, AAD =
+	  5-byte record header, inner content type after decrypt). Needs
+	  the ZXSEC-enabled libssl from this feed; falls back to plain
+	  OpenSSL at run time (ZXSEC_DISABLE=1) or when the key hook is
+	  missing. DTLS stays DTLS1.2 (ocserv/openconnect do not negotiate
+	  DTLS1.3).
 	* GnuTLS + ZXSEC: the DTLS and CSTP/TCP record layers are taken over
-	  in exactly the same way as the OpenSSL backend. The gnutls package
-	  in this feed carries a key hook in _gnutls_set_keys() and exports
-	  the current record sequence number so the self-managed codec can
-	  stay in sync after the handshake. Requires libgnutls from this feed.
+	  in exactly the same way as the OpenSSL backend, with CSTP
+	  supporting TLS1.2 and TLS1.3 (AES-GCM). The gnutls package
+	  in this feed carries key hooks in _gnutls_set_keys() and
+	  _tls13_set_keys() and exports the current record sequence number
+	  so the self-managed codec can stay in sync after the handshake.
+	  Requires libgnutls from this feed.
 endef
 
 TARGET_LDFLAGS += -Wl,--export-dynamic

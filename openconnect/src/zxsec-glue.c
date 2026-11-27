@@ -74,6 +74,10 @@ struct zxsec_pending_key {
 	int keylen;
 	uint8_t key[32];
 	uint8_t salt[ZXREC_SALT_LEN];
+	/* TLS1.3（RFC 8446）：没有 4B salt，只有 12B static IV。tls13=1 时
+	 * bind 走 zxsec_rl_set_key13()，记录层进入 1.3 记录格式。 */
+	int tls13;
+	uint8_t iv13[ZXREC_IV13_LEN];
 };
 
 struct zxsec_glue {
@@ -81,6 +85,7 @@ struct zxsec_glue {
 	int dtls_key[2];                   /* DTLS 0=read 1=write 已从库钩子装 key */
 	int tls_active;                    /* CSTP gate 通过后置 1 */
 	int tls_key[2];                    /* CSTP 0=read 1=write 已装 key */
+	int tls13;                         /* CSTP 协商的是 TLS1.3 */
 	void *tls_ssl;                     /* bind 时的 https_ssl，防串连接 */
 	struct zxsec_rl *rl;
 	struct zxsec_rl *tls_rl;
@@ -231,6 +236,81 @@ void oc_zxsec_gnutls_on_keys(void *session, int is_dtls, int epoch,
 
 	zxsec_on_keys(session, is_dtls, is_write, (uint16_t)epoch,
 		      key, key_len, iv, iv_len);
+}
+#endif
+
+/* -------------------- TLS1.3 密钥钩子 -------------------- */
+
+/*
+ * TLS1.3 与 1.2 的差别（RFC 8446 §5.2 / §7.3）：
+ *   - 没有 4B salt：密钥 = key + 12B static IV，nonce = iv XOR seq；
+ *   - application traffic key 是全新的密钥空间，两方向 seq 都从 0 起
+ *     （client Finished 用的是 handshake traffic key，另一把 key）；
+ *   - 外层记录头恒为 0x17/0x0303，真正的类型在密文内部，解密后从
+ *     明文尾部取（0x17 数据 / 0x15 alert / 0x16 handshake=KeyUpdate）。
+ * 只接 application traffic key：handshake 级密钥由库自己用（接管点在
+ * 握手完成之后）。DTLS 1.3 不做（ocserv/openconnect 不协商）。
+ */
+static void zxsec_on_keys13(void *ssl, int is_write,
+			    const unsigned char *key, size_t key_len,
+			    const unsigned char *iv, size_t iv_len)
+{
+	struct openconnect_info *vpninfo = g_zx.vpninfo;
+	int dir = is_write ? 1 : 0;
+
+	if (iv_len != ZXREC_IV13_LEN || (key_len != 16 && key_len != 32))
+		return;
+
+	/* 与 1.2 相同：握手阶段先按会话对象暂存 */
+	struct zxsec_pending_key *p = &g_zx.pend[dir];
+
+	p->ssl = ssl;
+	p->have = 1;
+	p->keylen = (int)key_len;
+	p->tls13 = 1;
+	memcpy(p->key, key, key_len);
+	memcpy(p->iv13, iv, ZXREC_IV13_LEN);
+
+	if (g_zx.tls_active && g_zx.tls_rl && ssl == g_zx.tls_ssl &&
+	    !zxsec_rl_set_key13(g_zx.tls_rl, dir, key, (int)key_len, iv)) {
+		g_zx.tls_key[dir] = 1;
+		if (vpninfo)
+			vpn_progress(vpninfo, PRG_DEBUG,
+				     _("ZXSEC: CSTP TLS1.3 %s keys reinstalled\n"),
+				     is_write ? "write" : "read");
+	}
+}
+
+#ifdef OPENCONNECT_OPENSSL
+/* libssl tls13_enc.c: tls13_change_cipher_state() 末尾（application 级）
+ * 的弱符号钩子，见 openssl 170 号补丁。 */
+void oc_zxsec_on_keys13(SSL *ssl, int is_write,
+			const unsigned char *key, size_t key_len,
+			const unsigned char *iv, size_t iv_len)
+{
+	zxsec_on_keys13((void *)ssl, is_write, key, key_len, iv, iv_len);
+}
+#endif
+
+#ifdef OPENCONNECT_GNUTLS
+/*
+ * GnuTLS constate.c: _tls13_set_keys() 末尾的弱符号钩子（110 号补丁）。
+ * is_app 区分 STAGE_APP（application traffic key）与 STAGE_HS（握手级）——
+ * 只接前者。STAGE_UPD_*（KeyUpdate）走 _tls13_update_keys()，不经过这里；
+ * 读方向遇到 inner handshake 记录时按不支持处理（断线重连）。
+ */
+void oc_zxsec_gnutls13_on_keys(void *session, int is_write,
+			       const unsigned char *key, unsigned key_len,
+			       const unsigned char *iv, unsigned iv_len,
+			       int cipher_id, int is_app)
+{
+	if (!is_app)
+		return;
+	if (cipher_id != GNUTLS_CIPHER_AES_128_GCM &&
+	    cipher_id != GNUTLS_CIPHER_AES_256_GCM)
+		return;
+
+	zxsec_on_keys13(session, is_write, key, key_len, iv, iv_len);
 }
 #endif
 
@@ -622,24 +702,28 @@ void zxsec_glue_tls_unbind(struct openconnect_info *vpninfo)
 	g_zx.tls_active = 0;
 	g_zx.tls_ssl = NULL;
 	g_zx.tls_key[0] = g_zx.tls_key[1] = 0;
+	g_zx.tls13 = 0;
 	g_zx.tls_rxoff = g_zx.tls_rxlen = 0;
 	g_zx.tls_pl_n = g_zx.tls_pl_idx = 0;
 	g_zx.tls_tx_len = g_zx.tls_tx_off = g_zx.tls_tx_done = 0;
 	g_zx.tls_tx_plen = 0;
 	g_zx.tls_tx_batch = 0;
 	g_zx.pend[0].have = g_zx.pend[1].have = 0;
+	g_zx.pend[0].tls13 = g_zx.pend[1].tls13 = 0;
 }
 
-/* 握手结束后调用一次：装 key、做 gate 检查 */
+/* 握手结束后调用一次：装 key、做 gate 检查（TLS1.2 与 TLS1.3 两个分支） */
 void zxsec_glue_tls_bind(struct openconnect_info *vpninfo)
 {
 	void *ssl = ZX_HTTPS_SESSION(vpninfo);
 	int ok = 0;
 	const char *cipher_name = "AES-GCM";
+	int is13;
 
 	g_zx.vpninfo = vpninfo;
 	g_zx.tls_active = 0;
 	g_zx.tls_key[0] = g_zx.tls_key[1] = 0;
+	g_zx.tls13 = 0;
 	g_zx.tls_ssl = ssl;
 	g_zx.tls_rxoff = g_zx.tls_rxlen = 0;
 	g_zx.tls_pl_n = g_zx.tls_pl_idx = 0;
@@ -665,13 +749,29 @@ void zxsec_glue_tls_bind(struct openconnect_info *vpninfo)
 		return;
 	}
 
+	/* 两个方向的 pend 必须是同一个 TLS 版本（一次连接不可能混用） */
+	is13 = g_zx.pend[0].tls13 || g_zx.pend[1].tls13;
+	if ((g_zx.pend[0].have && g_zx.pend[0].tls13 != is13) ||
+	    (g_zx.pend[1].have && g_zx.pend[1].tls13 != is13)) {
+		vpn_progress(vpninfo, PRG_DEBUG,
+			     _("ZXSEC: CSTP mixed TLS version keys, record layer disabled\n"));
+		return;
+	}
+	g_zx.tls13 = is13;
+
 	for (int dir = 0; dir < 2; dir++) {
 		struct zxsec_pending_key *p = &g_zx.pend[dir];
+		int r;
 
 		if (!p->have || p->ssl != ssl)
 			continue;
-		if (zxsec_rl_set_key(g_zx.tls_rl, dir, p->key, p->keylen,
-				     p->salt, 0, 0)) {
+		if (p->tls13)
+			r = zxsec_rl_set_key13(g_zx.tls_rl, dir, p->key,
+					       p->keylen, p->iv13);
+		else
+			r = zxsec_rl_set_key(g_zx.tls_rl, dir, p->key,
+					     p->keylen, p->salt, 0, 0);
+		if (r) {
 			vpn_progress(vpninfo, PRG_ERR,
 				     _("ZXSEC: CSTP %s key install failed\n"),
 				     dir ? "write" : "read");
@@ -680,10 +780,14 @@ void zxsec_glue_tls_bind(struct openconnect_info *vpninfo)
 		g_zx.tls_key[dir] = 1;
 		if (getenv("ZXSEC_DEBUG"))
 			fprintf(stderr,
-				"[cstp] bind %s key=%02x%02x%02x%02x..%02x salt=%02x%02x%02x%02x ssl=%p\n",
-				dir ? "wr" : "rd", p->key[0], p->key[1], p->key[2],
-				p->key[3], p->key[p->keylen - 1], p->salt[0],
-				p->salt[1], p->salt[2], p->salt[3], p->ssl);
+				"[cstp] bind %s ver=%s key=%02x%02x%02x%02x..%02x iv=%02x%02x%02x%02x ssl=%p\n",
+				dir ? "wr" : "rd", p->tls13 ? "tls13" : "tls12",
+				p->key[0], p->key[1], p->key[2],
+				p->key[3], p->key[p->keylen - 1],
+				p->tls13 ? p->iv13[0] : p->salt[0],
+				p->tls13 ? p->iv13[1] : p->salt[1],
+				p->tls13 ? p->iv13[2] : p->salt[2],
+				p->tls13 ? p->iv13[3] : p->salt[3], p->ssl);
 	}
 	if (!g_zx.tls_key[0] || !g_zx.tls_key[1]) {
 		vpn_progress(vpninfo, PRG_DEBUG,
@@ -696,38 +800,55 @@ void zxsec_glue_tls_bind(struct openconnect_info *vpninfo)
 		const SSL_CIPHER *c = SSL_get_current_cipher(ssl);
 		int nid = c ? SSL_CIPHER_get_cipher_nid(c) : NID_undef;
 
-		if (SSL_version(ssl) == TLS1_2_VERSION &&
-		    (nid == NID_aes_128_gcm || nid == NID_aes_256_gcm)) {
-			ok = 1;
-			cipher_name = c ? SSL_CIPHER_get_name(c) : "AES-GCM";
+		if (nid == NID_aes_128_gcm || nid == NID_aes_256_gcm) {
+			if (is13 && SSL_version(ssl) == TLS1_3_VERSION) {
+				ok = 1;
+				cipher_name = c ? SSL_CIPHER_get_name(c)
+						: "TLS1.3-AES-GCM";
+			} else if (!is13 && SSL_version(ssl) == TLS1_2_VERSION) {
+				ok = 1;
+				cipher_name = c ? SSL_CIPHER_get_name(c) : "AES-GCM";
+			}
 		}
 	}
 #elif defined(OPENCONNECT_GNUTLS)
 	{
 		gnutls_cipher_algorithm_t c = gnutls_cipher_get(ssl);
+		gnutls_protocol_t v = gnutls_protocol_get_version(ssl);
 
-		ok = (gnutls_protocol_get_version(ssl) == GNUTLS_TLS1_2 &&
-		      (c == GNUTLS_CIPHER_AES_128_GCM ||
-		       c == GNUTLS_CIPHER_AES_256_GCM));
-		if (c == GNUTLS_CIPHER_AES_128_GCM)
-			cipher_name = "AES-128-GCM";
-		else if (c == GNUTLS_CIPHER_AES_256_GCM)
-			cipher_name = "AES-256-GCM";
+		if (c == GNUTLS_CIPHER_AES_128_GCM ||
+		    c == GNUTLS_CIPHER_AES_256_GCM) {
+			if (is13 && v == GNUTLS_TLS1_3) {
+				ok = 1;
+				cipher_name = (c == GNUTLS_CIPHER_AES_128_GCM)
+					      ? "TLS1.3-AES-128-GCM"
+					      : "TLS1.3-AES-256-GCM";
+			} else if (!is13 && v == GNUTLS_TLS1_2) {
+				ok = 1;
+				cipher_name = (c == GNUTLS_CIPHER_AES_128_GCM)
+					      ? "AES-128-GCM" : "AES-256-GCM";
+			}
+		}
 	}
 #endif
 	if (!ok) {
 		vpn_progress(vpninfo, PRG_DEBUG,
-			     _("ZXSEC: CSTP version/cipher not TLS1.2/AES-GCM, record layer disabled\n"));
+			     _("ZXSEC: CSTP version/cipher not supported by record layer, disabled\n"));
 		return;
 	}
 
 #ifdef OPENCONNECT_GNUTLS
-	/* OpenSSL 的 Finished 用掉 seq 0，所以 set_key() 默认从 1 起。
-	 * GnuTLS 的握手记录数不固定，直接读取它当前的 sequence_number。 */
-	if (oc_zxsec_gnutls_get_seq) {
-		uint64_t wseq = 0;
-		if (oc_zxsec_gnutls_get_seq(ssl, NULL, &wseq) == 0)
-			zxsec_rl_set_seq(g_zx.tls_rl, 1, wseq);
+	if (!is13) {
+		/* OpenSSL 的 Finished 用掉 seq 0，所以 set_key() 默认从 1 起。
+		 * GnuTLS 的握手记录数不固定，直接读取它当前的 sequence_number。
+		 * TLS1.3 不需要：application traffic key 是新密钥空间，
+		 * set_key13() 已经把两方向 seq 归 0，读 EPOCH_WRITE_CURRENT
+		 * 得到的也是同一个值。 */
+		if (oc_zxsec_gnutls_get_seq) {
+			uint64_t wseq = 0;
+			if (oc_zxsec_gnutls_get_seq(ssl, NULL, &wseq) == 0)
+				zxsec_rl_set_seq(g_zx.tls_rl, 1, wseq);
+		}
 	}
 #endif
 
@@ -842,8 +963,10 @@ have_plain:
 					      g->tls_rxlen, recs, &nrecs,
 					      types, &consumed);
 
-			if (nrecs > 0 && types[0] != 0x17) {
-				/* alert 当成对端关闭；renegotiation 不支持 */
+			if (nrecs > 0 && !g->tls13 && types[0] != 0x17) {
+				/* alert 当成对端关闭；renegotiation 不支持。
+				 * （TLS1.3 外层记录恒为 0x17，不做此检查，
+				 * 真正的类型在解密后的明文尾部。） */
 				vpn_progress(vpninfo, PRG_ERR,
 					     _("ZXSEC: CSTP non-app record type %02x\n"),
 					     types[0]);
@@ -868,7 +991,7 @@ have_plain:
 				int i, r;
 
 				r = zxsec_rl_open_tls(g->tls_rl, recs, nrecs,
-						      out, outlen);
+						      out, outlen, types);
 				if (r) {
 					vpn_progress(vpninfo, PRG_ERR,
 						     _("ZXSEC: CSTP decrypt failed: %s\n"),
@@ -889,6 +1012,18 @@ have_plain:
 					g->tls_pl_len[i] = (size_t)outlen[i];
 					g->tls_pl_pos[i] = 0;
 					off += (size_t)outlen[i];
+				}
+				/* TLS1.3：解密后才知道真实类型。KeyUpdate 等
+				 * post-handshake 消息不受支持（换 key 没法跟，
+				 * 记录层会丢同步）——按连接错误断线重连；
+				 * alert 按对端关闭处理。 */
+				for (i = 0; i < nrecs; i++) {
+					if (g->tls13 && types[i] != 0x17) {
+						vpn_progress(vpninfo, PRG_ERR,
+							     _("ZXSEC: CSTP TLS1.3 inner record type %02x (KeyUpdate/PHA unsupported)\n"),
+							     types[i]);
+						return types[i] == 0x15 ? 0 : -EIO;
+					}
 				}
 				g->tls_pl_n = nrecs;
 				g->tls_pl_idx = 0;

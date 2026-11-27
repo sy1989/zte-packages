@@ -44,7 +44,12 @@ echo "[1/4] feeds.conf 首行: $(head -1 "$CONF")"
 # installed 标志为 1 时 install_src() 直接 return，必须先卸载再装。
 ./scripts/feeds uninstall openconnect libgnutls >/dev/null 2>&1 || true
 rm -f package/feeds/*/openconnect package/feeds/*/gnutls package/feeds/*/libgnutls 2>/dev/null || true
-echo "[2/4] 已清除同名包旧链接"
+# 过时的 tmp/info/.packageinfo-<name> 会让 is_core_src() 误判同名包为 core
+# （例如之前手动复制过 package/openconnect 的 SDK），install 直接被拒；
+# 删掉强制 prepare-tmpinfo 重新生成。
+rm -f tmp/info/.packageinfo-openconnect tmp/info/.packageinfo-gnutls 2>/dev/null || true
+[ -d tmp/info ] && make prepare-tmpinfo OPENWRT_BUILD= >/dev/null 2>&1 || true
+echo "[2/4] 已清除同名包旧链接与过时元数据"
 
 # ---- 3. 更新并从 zte 显式安装 ----
 ./scripts/feeds update zte
@@ -96,8 +101,12 @@ check "openssl 版本 3.5.7" \
 # 关键补丁都在
 check "openssl keyhook 补丁" \
 	"[ -f package/libs/openssl/patches/160-zxsec-tls12-keyhook.patch ]"
+check "openssl TLS1.3 keyhook 补丁" \
+	"[ -f package/libs/openssl/patches/170-zxsec-tls13-keyhook.patch ]"
 check "gnutls keyhook 补丁" \
 	"[ -f package/feeds/zte/gnutls/patches/100-zxsec-key-hook.patch ]"
+check "gnutls TLS1.3 keyhook 补丁" \
+	"[ -f package/feeds/zte/gnutls/patches/110-zxsec-tls13-keyhook.patch ]"
 check "openconnect GnuTLS 补丁" \
 	"[ -f package/feeds/zte/openconnect/patches/140-gnutls-record-layer.patch ]"
 
